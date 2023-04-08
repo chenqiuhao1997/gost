@@ -212,6 +212,7 @@ type ConnectOptions struct {
 	User      *url.Userinfo
 	Selector  gosocks5.Selector
 	UserAgent string
+	NeedWrap  bool
 	NoTLS     bool
 	NoDelay   bool
 }
@@ -267,3 +268,11 @@ func NoDelayConnectOption(b bool) ConnectOption {
 		opts.NoDelay = b
 	}
 }
+
+// NeedWrapConnectOption specifies the NeedWrap option for ss.Connect.
+func NeedWrapConnectOption(b bool) ConnectOption {
+	return func(opts *ConnectOptions) {
+		opts.NeedWrap = b
+	}
+}
+

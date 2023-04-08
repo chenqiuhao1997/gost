@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -41,6 +42,10 @@ func (c *httpConnector) ConnectContext(ctx context.Context, conn net.Conn, netwo
 	opts := &ConnectOptions{}
 	for _, option := range options {
 		option(opts)
+	}
+
+	if opts.NeedWrap {
+		return conn, nil
 	}
 
 	timeout := opts.Timeout
@@ -127,17 +132,20 @@ func (h *httpHandler) Init(options ...HandlerOption) {
 func (h *httpHandler) Handle(conn net.Conn) {
 	defer conn.Close()
 
-	req, err := http.ReadRequest(bufio.NewReader(conn))
-	if err != nil {
-		log.Logf("[http] %s - %s : %s", conn.RemoteAddr(), conn.LocalAddr(), err)
-		return
-	}
-	defer req.Body.Close()
+	var remained bool = true
+	for remained {
+		req, err := http.ReadRequest(bufio.NewReader(conn))
+		if err != nil {
+			log.Logf("[http] %s - %s : %s", conn.RemoteAddr(), conn.LocalAddr(), err)
+			return
+		}
 
-	h.handleRequest(conn, req)
+		remained = h.handleRequest(conn, req)
+		req.Body.Close()
+	}
 }
 
-func (h *httpHandler) handleRequest(conn net.Conn, req *http.Request) {
+func (h *httpHandler) handleRequest(conn net.Conn, req *http.Request) (remained bool) {
 	if req == nil {
 		return
 	}
@@ -212,7 +220,7 @@ func (h *httpHandler) handleRequest(conn net.Conn, req *http.Request) {
 		return
 	}
 
-	if req.Method == "PRI" || (req.Method != http.MethodConnect && req.URL.Scheme != "http") {
+	if req.Method == "PRI" {
 		resp.StatusCode = http.StatusBadRequest
 
 		if Debug {
@@ -238,6 +246,7 @@ func (h *httpHandler) handleRequest(conn net.Conn, req *http.Request) {
 	var err error
 	var cc net.Conn
 	var route *Chain
+	var opts *ConnectOptions
 	for i := 0; i < retries; i++ {
 		route, err = h.options.Chain.selectRouteFor(host)
 		if err != nil {
@@ -257,12 +266,17 @@ func (h *httpHandler) handleRequest(conn net.Conn, req *http.Request) {
 
 		// forward http request
 		lastNode := route.LastNode()
+		opts = &ConnectOptions{}
+		for _, option := range lastNode.ConnectOptions {
+			option(opts)
+		}
+
 		if req.Method != http.MethodConnect &&
-			lastNode.Protocol == "http" &&
+			(lastNode.Protocol == "http" || opts.NeedWrap) &&
 			!h.options.HTTPTunnel {
-			err = h.forwardRequest(conn, req, route)
+			err = h.forwardRequest(conn, req, route, opts.NeedWrap)
 			if err == nil {
-				return
+				return true
 			}
 			log.Logf("[http] %s -> %s : %s", conn.RemoteAddr(), conn.LocalAddr(), err)
 			continue
@@ -293,12 +307,23 @@ func (h *httpHandler) handleRequest(conn net.Conn, req *http.Request) {
 	defer cc.Close()
 
 	if req.Method == http.MethodConnect {
+		_, err = io.ReadAll(req.Body)
+		if err != nil {
+			return
+		}
 		b := []byte("HTTP/1.1 200 Connection established\r\n" +
 			"Proxy-Agent: " + proxyAgent + "\r\n\r\n")
 		if Debug {
 			log.Logf("[http] %s <- %s\n%s", conn.RemoteAddr(), conn.LocalAddr(), string(b))
 		}
-		conn.Write(b)
+		_, err = conn.Write(b)
+		if err != nil {
+			return
+		}
+
+		if opts.NeedWrap {
+			return true
+		}
 	} else {
 		req.Header.Del("Proxy-Connection")
 
@@ -311,6 +336,7 @@ func (h *httpHandler) handleRequest(conn net.Conn, req *http.Request) {
 	log.Logf("[http] %s <-> %s", conn.RemoteAddr(), host)
 	transport(conn, cc)
 	log.Logf("[http] %s >-< %s", conn.RemoteAddr(), host)
+	return false
 }
 
 func (h *httpHandler) authenticate(conn net.Conn, req *http.Request, resp *http.Response) (ok bool) {
@@ -395,7 +421,7 @@ func (h *httpHandler) authenticate(conn net.Conn, req *http.Request, resp *http.
 	return
 }
 
-func (h *httpHandler) forwardRequest(conn net.Conn, req *http.Request, route *Chain) error {
+func (h *httpHandler) forwardRequest(conn net.Conn, req *http.Request, route *Chain, needWrap bool) error {
 	if route.IsEmpty() {
 		return nil
 	}
@@ -426,11 +452,29 @@ func (h *httpHandler) forwardRequest(conn net.Conn, req *http.Request, route *Ch
 				req.Header.Set("Proxy-Authorization", "Basic "+userpass)
 			}
 
-			cc.SetWriteDeadline(time.Now().Add(WriteTimeout))
 			if !req.URL.IsAbs() {
 				req.URL.Scheme = "http" // make sure that the URL is absolute
 			}
-			err := req.WriteProxy(cc)
+
+			if needWrap {
+				if (strings.ToLower(req.URL.Scheme) == "http") &&
+					(strings.ToLower(route.LastNode().Transport) == "tls") {
+					req.URL.Scheme = "https"
+				}
+				req.RequestURI = ""
+				req.URL.Opaque = strings.TrimPrefix(req.URL.String(), req.URL.Scheme+":/")
+				req.Host = route.LastNode().Host
+				req.Header.Set("Host", req.Host)
+			}
+
+			if Debug {
+				dump, _ := httputil.DumpRequest(req, false)
+				log.Logf("[http] %s -> %s\n%s",
+				conn.RemoteAddr(), conn.LocalAddr(), string(dump))
+			}
+
+			cc.SetWriteDeadline(time.Now().Add(WriteTimeout))
+			err = req.WriteProxy(cc)
 			if err != nil {
 				log.Logf("[http] %s -> %s : %s", conn.RemoteAddr(), conn.LocalAddr(), err)
 				errc <- err

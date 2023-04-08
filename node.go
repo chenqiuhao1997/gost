@@ -116,6 +116,10 @@ func ParseNode(s string) (node Node, err error) {
 		node.Protocol = ""
 	}
 
+	if u.Scheme == "http+tls" {
+		node.ConnectOptions = append(node.ConnectOptions, NeedWrapConnectOption(true))
+	}
+
 	return
 }
 

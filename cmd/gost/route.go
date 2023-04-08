@@ -285,11 +285,11 @@ func parseChainNode(ns string) (nodes []gost.Node, err error) {
 		gost.HostDialOption(host),
 	)
 
-	node.ConnectOptions = []gost.ConnectOption{
+	node.ConnectOptions = append(node.ConnectOptions,
 		gost.UserAgentConnectOption(node.Get("agent")),
 		gost.NoTLSConnectOption(node.GetBool("notls")),
 		gost.NoDelayConnectOption(node.GetBool("nodelay")),
-	}
+	)
 
 	sshConfig := &gost.SSHConfig{}
 	if s := node.Get("ssh_key"); s != "" {
